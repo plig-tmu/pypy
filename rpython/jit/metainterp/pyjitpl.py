@@ -3622,6 +3622,16 @@ class MetaInterp(object):
         assert len(args) == targetjitdriver_sd.num_red_args
         warmrunnerstate = targetjitdriver_sd.warmstate
         token = warmrunnerstate.get_assembler_token(greenargs)
+        if warmrunnerstate.callee_frame:
+            # callee_frame: nothing to do while tracing: the callee Frame is still a
+            # fresh virtual in the trace and stays the vable argument of
+            # CALL_ASSEMBLER.  The rewrite to the "virtual entry" is done
+            # by the optimizer (OptVirtualize.optimize_CALL_ASSEMBLER_I).
+            # TODO(callee_frame): if the optimizer needs to know that the
+            # Frame box is dead after this call (the caller may still
+            # read the Frame afterwards), this is where the trace could
+            # record it.
+            pass
         opnum = OpHelpers.call_assembler_for_descr(calldescr)
         op = self.history.record_nospec(opnum, args, valueconst, descr=token)
         #

@@ -508,6 +508,14 @@ def send_loop_to_backend(greenkey, jitdriver_sd, metainterp_sd, loop, type,
     vinfo = jitdriver_sd.virtualizable_info
     if vinfo is not None:
         vable = orig_inpargs[jitdriver_sd.index_of_virtualizable].getref_base()
+        if jitdriver_sd.warmstate.callee_frame:
+            # callee_frame: before the patch below, loop.inputargs is already
+            # [red args..., vable fields...]: exactly the shape of the
+            # "virtual entry".  TODO(callee_frame): for a loop that starts
+            # at the portal entry, also compile an entry that skips the
+            # getfields (first allocating the Frame itself, later keeping
+            # it virtual) and store its token next to the normal one.
+            pass
         patch_new_loop_to_load_virtualizable_fields(loop, jitdriver_sd, vable)
 
     original_jitcell_token = loop.original_jitcell_token

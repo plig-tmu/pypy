@@ -246,6 +246,10 @@ class VirtualizableInfo(object):
         self.tracing_after_residual_call = tracing_after_residual_call
 
         def force_now(virtualizable):
+            # callee_frame: a callee Frame kept virtual has no heap
+            # object, so it can only reach here after the optimizer has
+            # materialized it at an escape point; from then on it is an
+            # ordinary vable.
             token = virtualizable.vable_token
             if token == TOKEN_TRACING_RESCALL:
                 # The values in the virtualizable are always correct during

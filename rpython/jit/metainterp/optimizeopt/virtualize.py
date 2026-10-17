@@ -1,5 +1,5 @@
 from rpython.jit.codewriter.effectinfo import EffectInfo
-from rpython.jit.metainterp.history import ConstInt
+from rpython.jit.metainterp.history import ConstInt, JitCellToken
 from rpython.jit.metainterp.history import CONST_NULL
 from rpython.jit.metainterp.optimize import InvalidLoop
 from rpython.jit.metainterp.optimizeopt import info, optimizer
@@ -88,6 +88,30 @@ class OptVirtualize(optimizer.Optimization):
             i = len(self.optimizer._newoperations) - 1
             assert i >= 0
             self.optimizer._newoperations.insert(i, guard_op)
+
+    def optimize_CALL_ASSEMBLER_I(self, op):
+        descr = op.getdescr()
+        if (isinstance(descr, JitCellToken) and
+                descr.outermost_jitdriver_sd is not None and
+                descr.outermost_jitdriver_sd.warmstate.callee_frame):
+            # callee_frame: today the vable argument is a virtual Frame that
+            # Optimizer._emit_operation() forces (new_with_vtable +
+            # setfields) just before the call.  TODO(callee_frame):
+            #  * if the vable argument is virtual (getptrinfo(arg).is_virtual())
+            #    AND it is not used after this op (pre-scan the trace, or
+            #    keep it virtual and force on later use), emit instead
+            #        CALL_ASSEMBLER(<red args minus vable>, <vable fields
+            #                       in vinfo order>, <non-vable fields>,
+            #                       descr=<virtual entry token>)
+            #    taking the field values from the virtual's info
+            #    (cf. virtualstate.VirtualState.make_inputargs);
+            #  * the token comes from warmstate (get_assembler_token,
+            #    second entry); fall back to emit(op) if there is none.
+            pass
+        return self.emit(op)
+    optimize_CALL_ASSEMBLER_R = optimize_CALL_ASSEMBLER_I
+    optimize_CALL_ASSEMBLER_F = optimize_CALL_ASSEMBLER_I
+    optimize_CALL_ASSEMBLER_N = optimize_CALL_ASSEMBLER_I
 
     def optimize_CALL_MAY_FORCE_I(self, op):
         effectinfo = op.getdescr().get_extra_info()

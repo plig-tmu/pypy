@@ -1401,6 +1401,12 @@ class ResumeDataDirectReader(AbstractResumeDataReader):
         # find the virtualizable from nums[-1], load all other values
         # from the CPU stack, and copy them into the virtualizable
         assert vable_size
+        # callee_frame: in a "virtual entry" the vable is a virtual, encoded as TAGVIRTUAL;
+        # next_ref() then allocates it via rd_virtuals.  TODO(callee_frame)
+        # verify that the virtual info carries the array field(s) of the
+        # vable (get_total_size() below reads them) and the non-vable
+        # fields, and that ResumeDataBoxReader.consume_vable_info (bridges)
+        # works on such a freshly allocated vable.
         virtualizable = self.next_ref()
         # just reset the token, we'll force it later
         assert vinfo.get_total_size(virtualizable) == vable_size - 1

@@ -1016,6 +1016,10 @@ class WarmRunnerDesc(object):
         vinfo = jd.virtualizable_info
 
         def assembler_call_helper(deadframe, virtualizableref):
+            # callee_frame: 'virtualizableref' is NULL for a call to the
+            # "virtual entry" (no vable argument).  It is unused here: the
+            # callee Frame, if needed, is rebuilt from resume data by
+            # handle_fail().
             fail_descr = self.cpu.get_latest_descr(deadframe)
             try:
                 fail_descr.handle_fail(deadframe, self.metainterp_sd, jd)

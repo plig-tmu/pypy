@@ -716,6 +716,10 @@ class WarmEnterState(object):
         redargtypes = ''.join([kind[0] for kind in jd.red_args_types])
 
         def get_assembler_token(greenkey):
+            # callee_frame: TODO(callee_frame) add a sibling that
+            # returns the "virtual entry" token of the same cell (inputargs
+            # = red args without the vable + vable fields), or None if it
+            # was not compiled yet.
             cell = JitCell.ensure_jit_cell_at_key(greenkey)
             procedure_token = cell.get_procedure_token()
             if procedure_token is None:
