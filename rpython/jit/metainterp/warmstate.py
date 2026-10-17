@@ -229,7 +229,7 @@ class BaseJitCell(object):
 
 
 class WarmEnterState(object):
-    callee_frame = False    # see set_param_callee_frame()
+    callee_frame = 0    # see set_param_callee_frame()
 
     def __init__(self, warmrunnerdesc, jitdriver_sd):
         "NOT_RPYTHON"
@@ -321,7 +321,8 @@ class WarmEnterState(object):
                 self.warmrunnerdesc.memory_manager.max_unroll_recursion = value
 
     def set_param_callee_frame(self, ivalue):
-        self.callee_frame = bool(ivalue)
+        # 0: off; 1: virtual entries; 2: also virtual bodies
+        self.callee_frame = ivalue
 
     def set_param_vec(self, ivalue):
         self.vec = bool(ivalue)

@@ -526,7 +526,7 @@ def _virtual_entry_prologue(jitdriver_sd, redkinds):
 def has_virtual_entry(jitdriver_sd):
     vinfo = jitdriver_sd.virtualizable_info
     return (vinfo is not None and vinfo.vable_size_descr is not None and
-            jitdriver_sd.warmstate.callee_frame)
+            jitdriver_sd.warmstate.callee_frame > 0)
 
 def virtual_entry_label(jitdriver_sd, loop, vable):
     """callee_frame: a TargetToken for the LABEL that
@@ -575,12 +575,23 @@ def compile_virtual_entry(greenkey, jitdriver_sd, metainterp_sd, redkinds,
     operations.append(ResOperation(rop.JUMP, jumpargs, descr=label_token))
     #
     token = label_token.original_jitcell_token
-    vloop = TreeLoop('virtual entry')
+    vtoken = _send_extra_loop_to_backend(greenkey, jitdriver_sd, metainterp_sd,
+                                         'virtual entry', inputargs,
+                                         operations, None, memo)
+    vtoken.virtual_entry_label = label_token
+    token.virtual_entry = vtoken
+
+def _send_extra_loop_to_backend(greenkey, jitdriver_sd, metainterp_sd, name,
+                                inputargs, operations, quasi_immutable_deps,
+                                memo):
+    """callee_frame: compile a loop that is not attached to any jitcell
+    (a virtual entry or a virtual body); returns its new JitCellToken"""
+    vloop = TreeLoop(name)
     vloop.inputargs = inputargs
     vloop.operations = operations
+    vloop.quasi_immutable_deps = quasi_immutable_deps
     vloop.original_jitcell_token = vtoken = make_jitcell_token(jitdriver_sd)
     vtoken.is_virtual_entry = True
-    vtoken.virtual_entry_label = label_token
     vtoken.number = metainterp_sd.jitlog.trace_id
     if not we_are_translated():
         vloop.check_consistency()
@@ -596,12 +607,104 @@ def compile_virtual_entry(greenkey, jitdriver_sd, metainterp_sd, redkinds,
         debug_stop("jit-backend")
     metainterp_sd.stats.add_new_loop(vloop)
     metainterp_sd.logger_ops.log_loop(vloop.inputargs, vloop.operations,
-                                      vtoken.number, "virtual entry", None,
+                                      vtoken.number, name, None,
                                       name=loopname)
     if metainterp_sd.warmrunnerdesc is not None:    # for tests
         metainterp_sd.warmrunnerdesc.memory_manager.keep_loop_alive(vtoken)
     record_loop_or_bridge(metainterp_sd, vloop)
-    token.virtual_entry = vtoken
+    return vtoken
+
+class VirtualFrameCompileData(SimpleCompileData):
+    """callee_frame: optimize an entry trace again with its vable replaced
+    by a virtual allocated in a prologue (see compile_virtual_body()).
+    After optimize(), info.inputargs are those of a virtual entry (see
+    _virtual_entry_prologue())."""
+    log_noopt = False
+
+    def __init__(self, trace, vable, call_pure_results=None,
+                 enable_opts=None):
+        SimpleCompileData.__init__(self, trace, None, call_pure_results,
+                                   enable_opts)
+        self.vable = vable
+
+    def optimize(self, metainterp_sd, jitdriver_sd, optimizations):
+        from rpython.jit.metainterp.optimizeopt.optimizer import Optimizer
+        vinfo = jitdriver_sd.virtualizable_info
+        opt = Optimizer(metainterp_sd, jitdriver_sd, optimizations)
+        traceiter = self.trace.get_iter()
+        opt.trace = traceiter
+        oldargs = traceiter.inputargs
+        num_red_args = jitdriver_sd.num_red_args
+        index_vable = jitdriver_sd.index_of_virtualizable
+        newvable = ResOperation(rop.NEW_WITH_VTABLE, [],
+                                descr=vinfo.vable_size_descr)
+        opt.send_extra_operation(newvable)
+        inputargs = []
+        for i in range(num_red_args):
+            if i != index_vable:
+                inputargs.append(oldargs[i])
+        i = num_red_args
+        for descr in vinfo.static_field_descrs:
+            inputargs.append(oldargs[i])
+            i += 1
+        extraboxes = []
+        for descr in vinfo.virtual_entry_extra_descrs:
+            box = _inputarg_for_field(descr)
+            inputargs.append(box)
+            extraboxes.append(box)
+            opt.send_extra_operation(ResOperation(rop.SETFIELD_GC,
+                                                  [newvable, box],
+                                                  descr=descr))
+        for k in range(len(vinfo.array_field_descrs)):
+            arraybox = extraboxes[vinfo.virtual_entry_extra_descrs.index(
+                vinfo.array_field_descrs[k])]
+            arraydescr = vinfo.array_descrs[k]
+            for index in range(vinfo.get_array_length(self.vable, k)):
+                item = ResOperation(
+                    OpHelpers.getarrayitem_for_descr(arraydescr),
+                    [arraybox, ConstInt(index)], descr=arraydescr)
+                opt.send_extra_operation(item)
+                oldargs[i].set_forwarded(opt.get_box_replacement(item))
+                i += 1
+        assert i == len(oldargs)
+        oldargs[index_vable].set_forwarded(newvable)
+        info, newops = opt.propagate_all_forward(traceiter,
+                                                 self.call_pure_results)
+        info.inputargs = inputargs
+        return info, newops
+
+def compile_virtual_body(metainterp, greenkey, token, vable):
+    """callee_frame >= 2: compile the "virtual body" of the procedure
+    'token' that was just compiled from metainterp.history: the same trace
+    optimized again with the vable as a virtual, which is only materialized
+    where it escapes or when a guard fails (from resume data).  It takes
+    the arguments of a virtual entry, so token.virtual_entry is redirected
+    to it.  Its guards are its own, so its bridges are traced separately.
+    """
+    jitdriver_sd = metainterp.jitdriver_sd
+    metainterp_sd = metainterp.staticdata
+    ventry = token.virtual_entry
+    if ventry is None or ventry.virtual_entry_label is None:
+        return     # no virtual entry of its own (see virtual_entry_label())
+    data = VirtualFrameCompileData(metainterp.history.trace, vable,
+                                   metainterp.call_pure_results,
+                                   jitdriver_sd.warmstate.enable_opts)
+    try:
+        info, newops = data.optimize_trace(metainterp_sd, jitdriver_sd,
+                                           metainterp.box_names_memo)
+    except InvalidLoop:
+        return
+    if not newops or newops[-1].getopnum() != rop.FINISH:
+        return     # ponytail: only straight-line entries (no jump to a loop)
+    forget_optimization_info(newops)
+    forget_optimization_info(info.inputargs)
+    vbody = _send_extra_loop_to_backend(greenkey, jitdriver_sd, metainterp_sd,
+                                        'virtual body', info.inputargs,
+                                        newops, info.quasi_immutable_deps,
+                                        metainterp.box_names_memo)
+    metainterp_sd.cpu.redirect_call_assembler(ventry, vbody)
+    ventry.record_jump_to(vbody)
+    ventry.virtual_body = vbody
 
 def propagate_original_jitcell_token(trace):
     for op in trace.operations:
@@ -1174,6 +1277,13 @@ class ResumeFromInterpDescr(ResumeDescr):
             self.original_greenkey, jitcell_token)
         metainterp_sd.stats.add_jitcell_token(jitcell_token)
         record_loop_or_bridge(metainterp_sd, new_loop)
+        if (jitdriver_sd.virtualizable_info is not None and
+                jitdriver_sd.warmstate.callee_frame >= 2):
+            # ponytail: always, for every entry bridge; when to do it
+            # (e.g. only once the virtual entry is called often) is open
+            vable = orig_inputargs[jitdriver_sd.index_of_virtualizable]
+            compile_virtual_body(metainterp, self.original_greenkey,
+                                 jitcell_token, vable.getref_base())
 
     def get_resumestorage(self):
         return None

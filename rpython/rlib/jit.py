@@ -579,7 +579,8 @@ PARAMETER_DOCS = {
                    'optimizations to enable, or all = %s' % ENABLE_ALL_OPTS,
     'max_unroll_recursion': 'how many levels deep to unroll a recursive function',
     'callee_frame': 'EXPERIMENTAL: pass the fields of a fresh callee virtualizable '
-                    'to call_assembler instead of allocating it (1/0)',
+                    'to call_assembler instead of allocating it (0: off, '
+                    '1: virtual entries, 2: also virtual bodies)',
     'vec': 'turn on the vectorization optimization (vecopt). ' \
            'Supports x86 (SSE 4.1), powerpc (SVX), s390x SIMD',
     'vec_cost': 'threshold for which traces to bail. Unpacking increases the counter,'\
