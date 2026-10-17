@@ -30,14 +30,11 @@ class Frame(object):
 
 driver = JitDriver(greens=['code'], reds=['frame'], virtualizables=['frame'])
 
-class Seen(object):
-    log = []
-seen = Seen()
-
 @dont_look_inside
 def peek(frame):
-    # residual call that receives the frame => forces it via vable_token
-    seen.log.append(frame.n * 100 + frame.acc)
+    # residual call that receives the frame => forces it via vable_token;
+    # the result shows whether the forced Frame has the right fields
+    return frame.n * 100 + frame.acc
 
 class Boom(Exception):
     pass
@@ -52,9 +49,10 @@ def portal(code, frame):
         if code == 2 and n == 0:
             raise Boom
         return n
+    extra = 0
     if code == 1 and n == 3:
         frame.acc = 7
-        peek(frame)
+        extra = peek(frame)
     if code == 3 and n == 3:
         frame.acc = 5
     try:
@@ -65,10 +63,9 @@ def portal(code, frame):
         b = portal(code, Frame(n - 2))
     except Boom:
         b = 0
-    return a + b + frame.acc
+    return a + b + frame.acc + extra
 
 def main(code, n):
-    del seen.log[:]
     return portal(code, Frame(n))
 
 
@@ -130,32 +127,106 @@ class CalleeFrameTests:
         for code in [0, 1, 2, 3]:
             assert self.run(code, 15, 1) == main(code, 15)
 
-    def test_force_sees_fields_flag_on(self):
-        expected = (main(1, 15), seen.log[:])
-        assert self.run(1, 15, 1) == expected[0]
-        assert seen.log == expected[1]
-
     def test_caller_reads_callee_frame_after_call(self):
         # like test_recursive.test_directly_call_assembler_virtualizable:
         # the caller reads the callee frame after call_assembler returns,
         # so callee_frame must fall back to the materialized Frame here.
         def portal2(code, frame):
+            # the result is only passed back through the callee's Frame
             driver.jit_merge_point(code=code, frame=frame)
             n = frame.n
             if n < 2:
                 frame.acc = n
-                return n
-            sub = Frame(n - 1)
-            a = portal2(code, sub)
-            frame.acc = sub.acc + a
-            return a + portal2(code, Frame(n - 2))
+                return 0
+            sub1 = Frame(n - 1)
+            portal2(code, sub1)
+            sub2 = Frame(n - 2)
+            portal2(code, sub2)
+            frame.acc = sub1.acc + sub2.acc
+            return 0
         def main2(code, n):
             f = Frame(n)
-            return portal2(code, f) * 1000 + f.acc
+            portal2(code, f)
+            return f.acc
         res = self.meta_interp(main2, [0, 12], inline=True,
                                max_unroll_recursion=1, callee_frame=1)
-        assert res == main2(0, 12)
+        assert res == main2(0, 12) == 144
         assert self.count_call_assembler() > 0
+
+    # ---- the virtual entry itself (callee side) ----
+
+    def virtual_entries(self):
+        return [token.virtual_entry
+                for token in get_stats().get_all_jitcell_tokens()
+                if token.virtual_entry is not None]
+
+    def call_virtual_entry(self, vtoken, *args):
+        # what CALL_ASSEMBLER does, for an INT result
+        from rpython.rtyper.lltypesystem import lltype, llmemory
+        metainterp_sd = get_stats().metainterp_sd
+        cpu = metainterp_sd.cpu
+        deadframe = cpu.execute_token(vtoken, *args)
+        if cpu.get_latest_descr(deadframe) is cpu.done_with_this_frame_descr_int:
+            return cpu.get_int_value(deadframe, 0)
+        jd = vtoken.outermost_jitdriver_sd
+        return jd._assembler_call_helper(deadframe,
+                                         lltype.nullptr(llmemory.GCREF.TO))
+
+    def test_no_virtual_entry_flag_off(self):
+        self.run(0, 15, 0)
+        assert self.virtual_entries() == []
+
+    def test_virtual_entry_compiled(self):
+        self.run(0, 15, 1)
+        [vtoken] = self.virtual_entries()
+        assert vtoken.is_virtual_entry
+        # inputargs: [n, acc] (the vable fields); the Frame is allocated
+        # at the head of the virtual entry
+        for n in [0, 1, 2, 5, 10, 15]:
+            assert self.call_virtual_entry(vtoken, n, 0) == main(0, n)
+
+    def test_virtual_entry_slow_paths(self):
+        for code in [1, 2, 3]:
+            self.run(code, 15, 1)
+            for vtoken in self.virtual_entries():
+                for n in [3, 4, 9]:
+                    try:
+                        got = self.call_virtual_entry(vtoken, n, 0)
+                    except Exception:
+                        got = 'raised'
+                    try:
+                        expected = portal(code, Frame(n))
+                    except Boom:
+                        expected = 'raised'
+                    assert got == expected
+
+    def test_virtual_entry_extra_fields(self):
+        # a field outside _virtualizable_ becomes an extra argument
+        class Frame2(object):
+            _virtualizable_ = ['n']
+            def __init__(self, n, base):
+                self = hint(self, access_directly=True,
+                            fresh_virtualizable=True)
+                self.n = n
+                self.base = base
+        driver2 = JitDriver(greens=['code'], reds=['frame'],
+                            virtualizables=['frame'])
+        def portal2(code, frame):
+            driver2.jit_merge_point(code=code, frame=frame)
+            n = frame.n
+            if n < 2:
+                return frame.base + n
+            return (portal2(code, Frame2(n - 1, frame.base)) +
+                    portal2(code, Frame2(n - 2, frame.base)))
+        def main2(code, n, base):
+            return portal2(code, Frame2(n, base))
+        res = self.meta_interp(main2, [0, 15, 1000], inline=True,
+                               max_unroll_recursion=1, callee_frame=1)
+        assert res == main2(0, 15, 1000)
+        [vtoken] = self.virtual_entries()
+        for n in [0, 1, 5, 12]:
+            assert self.call_virtual_entry(vtoken, n, 7) == portal2(
+                0, Frame2(n, 7))
 
     # ---- target: no caller-side Frame allocation for call_assembler ----
 
@@ -182,10 +253,8 @@ class CalleeFrameTests:
 
     @frame_virtual
     def test_force_materializes_frame(self):
-        expected = (main(1, 15), seen.log[:])
-        assert expected[1]      # peek() did run
-        assert self.run(1, 15, 1) == expected[0]
-        assert seen.log == expected[1]
+        # peek() reads the forced Frame; its result is part of the result
+        assert self.run(1, 15, 1) == main(1, 15)
         assert self.frame_allocs_except_escapes() == 0
 
     @frame_virtual
