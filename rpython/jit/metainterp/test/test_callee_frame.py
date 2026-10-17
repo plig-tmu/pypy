@@ -15,7 +15,7 @@ from rpython.jit.metainterp.warmspot import get_stats
 fields_passed = py.test.mark.xfail(strict=True,
     reason="callee_frame: fields not passed to call_assembler yet")
 frame_virtual = py.test.mark.xfail(strict=True,
-    reason="callee_frame: Frame not kept virtual in the callee yet")
+    reason="callee_frame: needs the caller-side rewrite (callee_frame=2)")
 
 
 # ---------- the toy interpreter: fib(n) with one virtualizable Frame ----------
@@ -81,6 +81,10 @@ class CalleeFrameTests:
                      for op in loop.operations
                      if rop.is_call_assembler(op.getopnum()))
 
+    def is_frame_descr(self, descr):
+        jd = get_stats().metainterp_sd.jitdrivers_sd[0]
+        return descr is jd.virtualizable_info.vable_size_descr
+
     def frames_allocated_for_call_assembler(self):
         """Number of call_assembler or keepalive ops that get an argument
         produced by a new_with_vtable in the same trace (= caller-side
@@ -102,10 +106,16 @@ class CalleeFrameTests:
         are not recorded by get_stats()) whose result is not passed to a
         residual call, i.e. allocations that are not an escape point."""
         count = 0
-        for loop in get_stats().get_all_loops():
+        loops = get_stats().get_all_loops()
+        # with a virtual body, the virtual entry is redirected to it and
+        # never runs (the toy has a single procedure)
+        redirected = [loop for loop in loops if loop.name == 'virtual body']
+        for loop in loops:
+            if redirected and loop.name == 'virtual entry':
+                continue
             frames = [op for op in loop.operations
                       if op.getopnum() == rop.NEW_WITH_VTABLE and
-                         'Frame' in op.getdescr().S._name]
+                         self.is_frame_descr(op.getdescr())]
             escaped = set()
             for op in loop.operations:
                 if (rop.is_call(op.getopnum()) and
@@ -188,10 +198,14 @@ class CalleeFrameTests:
             assert self.call_virtual_entry(vtoken, n, 0) == main(0, n)
 
     def test_virtual_entry_slow_paths(self):
+        self.check_slow_paths(1)
+
+    def check_slow_paths(self, callee_frame):
         for code in [1, 2, 3]:
-            self.run(code, 15, 1)
+            self.run(code, 15, callee_frame)
             for vtoken in self.virtual_entries():
-                for n in [3, 4, 9]:
+                # several times each, so that bridges get compiled too
+                for n in [3, 4, 9, 3, 4, 9, 0, 1, 0, 1]:
                     try:
                         got = self.call_virtual_entry(vtoken, n, 0)
                     except Exception:
@@ -230,6 +244,73 @@ class CalleeFrameTests:
             assert self.call_virtual_entry(vtoken, n, 7) == portal2(
                 0, Frame2(n, 7))
 
+    # ---- the virtual body (callee_frame=2, callee side) ----
+
+    def own_frame_allocs(self, operations):
+        """new_with_vtable(Frame) whose result is not passed to any call
+        or keepalive, i.e. the procedure's own Frame being allocated."""
+        used = set()
+        for op in operations:
+            if (rop.is_call(op.getopnum()) or
+                    rop.is_call_assembler(op.getopnum()) or
+                    op.getopnum() == rop.KEEPALIVE):
+                used.update(op.getarglist())
+        return len([op for op in operations
+                    if op.getopnum() == rop.NEW_WITH_VTABLE and
+                       self.is_frame_descr(op.getdescr()) and
+                       op not in used])
+
+    def collect_bridges(self):
+        from rpython.jit.metainterp import compile
+        bridges = []
+        orig = compile.send_bridge_to_backend
+        def send(jitdriver_sd, metainterp_sd, faildescr, inputargs,
+                 operations, original_loop_token, memo):
+            bridges.append((original_loop_token, list(operations)))
+            return orig(jitdriver_sd, metainterp_sd, faildescr, inputargs,
+                        operations, original_loop_token, memo)
+        compile.send_bridge_to_backend = send
+        def undo():
+            compile.send_bridge_to_backend = orig
+        return bridges, undo
+
+    def test_no_virtual_body_flag_1(self):
+        self.run(0, 15, 1)
+        [vtoken] = self.virtual_entries()
+        assert vtoken.virtual_body is None
+
+    def test_virtual_body_compiled(self):
+        self.run(0, 15, 2)
+        [vtoken] = self.virtual_entries()
+        assert vtoken.virtual_body is not None
+        [body] = [loop for loop in get_stats().get_all_loops()
+                  if loop.name == 'virtual body']
+        assert self.own_frame_allocs(body.operations) == 0
+        # the virtual entry is redirected to the virtual body
+        for n in [0, 1, 2, 5, 10, 15]:
+            assert self.call_virtual_entry(vtoken, n, 0) == main(0, n)
+
+    def test_virtual_body_slow_paths(self):
+        self.check_slow_paths(2)
+
+    def test_virtual_body_bridge_keeps_frame_virtual(self):
+        bridges, undo = self.collect_bridges()
+        try:
+            self.run(0, 15, 2)
+            [vtoken] = self.virtual_entries()
+            body = vtoken.virtual_body
+            # n < 2 fails the first guard of the body: blackhole first,
+            # then a bridge out of the virtual body (unless the run made
+            # one already)
+            for i in range(10):
+                assert self.call_virtual_entry(vtoken, 1, 0) == 1
+        finally:
+            undo()
+        mine = [ops for token, ops in bridges if token is body]
+        assert mine
+        for ops in mine:
+            assert self.own_frame_allocs(ops) == 0
+
     # ---- target: no caller-side Frame allocation for call_assembler ----
 
     @fields_passed
@@ -242,7 +323,7 @@ class CalleeFrameTests:
 
     @frame_virtual
     def test_frame_virtual_in_callee(self):
-        assert self.run(0, 15, 1) == main(0, 15)
+        assert self.run(0, 15, 2) == main(0, 15)
         assert self.count_call_assembler() > 0
         assert self.frame_allocs_except_escapes() == 0
 
@@ -250,18 +331,18 @@ class CalleeFrameTests:
     def test_guard_failure_in_callee(self):
         # code 3 takes a rare branch at n == 3 and later reads frame.acc:
         # the guard failure must rebuild the Frame with the right fields
-        assert self.run(3, 15, 1) == main(3, 15)
+        assert self.run(3, 15, 2) == main(3, 15)
         assert self.frame_allocs_except_escapes() == 0
 
     @frame_virtual
     def test_force_materializes_frame(self):
         # peek() reads the forced Frame; its result is part of the result
-        assert self.run(1, 15, 1) == main(1, 15)
+        assert self.run(1, 15, 2) == main(1, 15)
         assert self.frame_allocs_except_escapes() == 0
 
     @frame_virtual
     def test_exception_in_callee(self):
-        assert self.run(2, 15, 1) == main(2, 15)
+        assert self.run(2, 15, 2) == main(2, 15)
         assert self.frame_allocs_except_escapes() == 0
 
 
