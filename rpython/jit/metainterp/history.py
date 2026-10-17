@@ -440,11 +440,12 @@ class JitCellToken(AbstractDescr):
     retraced_count = 0
     invalidated = False
     outermost_jitdriver_sd = None
-    # callee_frame: the "virtual entry" of this procedure, i.e. a second
-    # compiled version that takes the virtualizable's fields as arguments
-    # instead of the virtualizable itself (see compile_virtual_entry())
+    # callee_frame: the "virtual entry" of this procedure, i.e. a small
+    # loop that takes the virtualizable's fields as arguments instead of
+    # the virtualizable itself and jumps into it (see compile_virtual_entry())
     virtual_entry = None
     is_virtual_entry = False
+    virtual_entry_label = None   # keeps alive the TargetToken it jumps to
     # and more data specified by the backend when the loop is compiled
     number = -1
     generation = r_int64(0)
