@@ -1,9 +1,11 @@
+from rpython.jit.codewriter import heaptracker
 from rpython.jit.codewriter.effectinfo import EffectInfo
 from rpython.jit.metainterp import history
 from rpython.jit.metainterp.warmstate import wrap, unwrap
 from rpython.rlib.unroll import unrolling_iterable
 from rpython.rtyper import rvirtualizable
 from rpython.rtyper.lltypesystem import lltype, llmemory
+from rpython.rtyper import rclass
 from rpython.rtyper.rclass import IR_IMMUTABLE_ARRAY, IR_IMMUTABLE
 
 
@@ -214,6 +216,30 @@ class VirtualizableInfo(object):
             assert lltype.typeOf(virtualizable) == llmemory.GCREF
             return lltype.cast_opaque_ptr(VTYPEPTR, virtualizable)
         self.cast_gcref_to_vtype = cast_gcref_to_vtype
+
+        # callee_frame: what a "virtual entry" needs to allocate the
+        # virtualizable itself.  Only for instances of exactly VTYPE's
+        # class (vable_size_descr is None if that class has no vtable).
+        vtable = heaptracker.get_vtable_for_gcstruct(cpu, VTYPE)
+        if vtable:
+            self.vable_size_descr = cpu.sizeof(VTYPE, vtable)
+            # the fields that are neither vable_token nor static
+            # virtualizable fields (includes the array fields): they are
+            # extra arguments of the virtual entry, in this order
+            self.virtual_entry_extra_descrs = [
+                descr for descr in self.vable_size_descr.get_all_fielddescrs()
+                if descr is not self.vable_token_descr and
+                   descr not in self.static_field_descrs]
+        else:
+            self.vable_size_descr = None
+            self.virtual_entry_extra_descrs = []
+
+        def is_exact_vtype(virtualizable):
+            if not vtable:
+                return False
+            obj = lltype.cast_opaque_ptr(rclass.OBJECTPTR, virtualizable)
+            return obj.typeptr == vtable
+        self.is_exact_vtype = is_exact_vtype
 
         def clear_vable_token(virtualizable):
             virtualizable = cast_gcref_to_vtype(virtualizable)

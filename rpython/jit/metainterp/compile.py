@@ -460,6 +460,182 @@ def patch_new_loop_to_load_virtualizable_fields(loop, jitdriver_sd, vable):
         emit_op(extra_ops, op)
     loop.operations = extra_ops
 
+def _inputarg_of_type(tp):
+    if tp == 'r':
+        return InputArgRef()
+    elif tp == 'f':
+        return InputArgFloat()
+    else:
+        assert tp == 'i'
+        return InputArgInt()
+
+def _clone_guard_descr(descr):
+    # a copy of 'descr' for the same guard in another compiled loop,
+    # sharing the resume data; None if we don't know how to copy it
+    if isinstance(descr, ResumeGuardCopiedExcDescr):
+        newdescr = ResumeGuardCopiedExcDescr(descr.prev)
+    elif isinstance(descr, ResumeGuardCopiedDescr):
+        newdescr = ResumeGuardCopiedDescr(descr.prev)
+    elif isinstance(descr, CompileLoopVersionDescr):
+        return None
+    elif isinstance(descr, ResumeGuardDescr):
+        if isinstance(descr, ResumeGuardForcedDescr):
+            newdescr = ResumeGuardForcedDescr()
+            newdescr._init(descr.metainterp_sd, descr.jitdriver_sd)
+        elif isinstance(descr, ResumeGuardExcDescr):
+            newdescr = ResumeGuardExcDescr()
+        elif isinstance(descr, ResumeAtPositionDescr):
+            newdescr = ResumeAtPositionDescr()
+        else:
+            newdescr = ResumeGuardDescr()
+        newdescr.copy_all_attributes_from(descr)
+    else:
+        return None
+    newdescr.status = descr.status    # shares the jitcounter hash
+    return newdescr
+
+def _inputarg_for_field(descr):
+    opnum = OpHelpers.getfield_for_descr(descr)
+    if opnum == rop.GETFIELD_GC_R:
+        return InputArgRef()
+    elif opnum == rop.GETFIELD_GC_F:
+        return InputArgFloat()
+    else:
+        return InputArgInt()
+
+def _virtual_entry_prologue(jitdriver_sd, redkinds):
+    """callee_frame: the inputargs of a "virtual entry", always
+
+        [red args without the vable] + [vinfo.static_field_descrs]
+                                     + [vinfo.virtual_entry_extra_descrs]
+
+    (the extra ones include the array fields, so that the layout does not
+    depend on array lengths), and the operations that allocate the vable
+    and fill in the extra fields.  Returns (inputargs, redboxes,
+    staticboxes, extraboxes, operations); redboxes[index_of_virtualizable]
+    is the NEW_WITH_VTABLE operation.
+    """
+    vinfo = jitdriver_sd.virtualizable_info
+    inputargs = []
+    redboxes = []
+    for i in range(len(redkinds)):
+        if i == jitdriver_sd.index_of_virtualizable:
+            redboxes.append(None)
+        else:
+            box = _inputarg_of_type(redkinds[i])
+            inputargs.append(box)
+            redboxes.append(box)
+    staticboxes = []
+    for descr in vinfo.static_field_descrs:
+        box = _inputarg_for_field(descr)
+        inputargs.append(box)
+        staticboxes.append(box)
+    newvable = ResOperation(rop.NEW_WITH_VTABLE, [],
+                            descr=vinfo.vable_size_descr)
+    redboxes[jitdriver_sd.index_of_virtualizable] = newvable
+    operations = [newvable]
+    extraboxes = []
+    for descr in vinfo.virtual_entry_extra_descrs:
+        box = _inputarg_for_field(descr)
+        inputargs.append(box)
+        extraboxes.append(box)
+        operations.append(ResOperation(rop.SETFIELD_GC, [newvable, box],
+                                       descr=descr))
+    return inputargs, redboxes, staticboxes, extraboxes, operations
+
+def has_virtual_entry(jitdriver_sd):
+    vinfo = jitdriver_sd.virtualizable_info
+    return (vinfo is not None and vinfo.vable_size_descr is not None and
+            jitdriver_sd.warmstate.callee_frame)
+
+def compile_virtual_entry(greenkey, jitdriver_sd, metainterp_sd, loop, vable,
+                          memo):
+    """callee_frame: compile a second version of 'loop' (which must not
+    be patched by patch_new_loop_to_load_virtualizable_fields() yet) and
+    store it as loop.original_jitcell_token.virtual_entry.  See
+    _virtual_entry_prologue() for its inputargs.
+
+    For now it allocates the virtualizable at its head and fills in the
+    extra fields; the static vable fields are not stored, like in the
+    normal entry (resume and force write them), and the array items are
+    read from the array.  Not done if the vable is not exactly of the
+    class declaring _virtualizable_, or if the loop contains a LABEL.
+    """
+    vinfo = jitdriver_sd.virtualizable_info
+    token = loop.original_jitcell_token
+    if (token.virtual_entry is not None or not has_virtual_entry(jitdriver_sd)
+            or not vinfo.is_exact_vtype(vable)):
+        return
+    for op in loop.operations:
+        if op.getopnum() == rop.LABEL:
+            # ponytail: no copying of TargetTokens, so no loops; callers
+            # keep the virtual entry of the tmp callback (through the
+            # interpreter).  Add it when portal entries that are loops matter
+            return
+    num_red_args = jitdriver_sd.num_red_args
+    redkinds = [box.type for box in loop.inputargs[:num_red_args]]
+    inputargs, redboxes, staticboxes, extraboxes, operations = (
+        _virtual_entry_prologue(jitdriver_sd, redkinds))
+    mapping = {}
+    for i in range(num_red_args):
+        mapping[loop.inputargs[i]] = redboxes[i]
+    i = num_red_args
+    for box in staticboxes:
+        mapping[loop.inputargs[i]] = box
+        i += 1
+    for k in range(len(vinfo.array_field_descrs)):
+        arraybox = extraboxes[vinfo.virtual_entry_extra_descrs.index(
+            vinfo.array_field_descrs[k])]
+        arraydescr = vinfo.array_descrs[k]
+        for index in range(vinfo.get_array_length(vable, k)):
+            item = ResOperation(OpHelpers.getarrayitem_for_descr(arraydescr),
+                                [arraybox, ConstInt(index)], descr=arraydescr)
+            operations.append(item)
+            mapping[loop.inputargs[i]] = item
+            i += 1
+    assert i == len(loop.inputargs)
+    for op in loop.operations:
+        args = [mapping.get(arg, arg) for arg in op.getarglist()]
+        if rop.is_guard(op.getopnum()):
+            descr = _clone_guard_descr(op.getdescr())
+            if descr is None:
+                return
+            newop = op.copy_and_change(op.getopnum(), args=args, descr=descr)
+            newop.setfailargs([mapping.get(arg, arg)
+                               for arg in op.getfailargs()])
+        else:
+            newop = op.copy_and_change(op.getopnum(), args=args)
+        mapping[op] = newop
+        operations.append(newop)
+    #
+    vloop = TreeLoop(loop.name + ' (virtual entry)')
+    vloop.inputargs = inputargs
+    vloop.operations = operations
+    vloop.quasi_immutable_deps = loop.quasi_immutable_deps
+    vloop.original_jitcell_token = vtoken = make_jitcell_token(jitdriver_sd)
+    vtoken.is_virtual_entry = True
+    vtoken.number = metainterp_sd.jitlog.trace_id
+    if not we_are_translated():
+        vloop.check_consistency()
+    debug_start("jit-backend")
+    try:
+        loopname = jitdriver_sd.warmstate.get_location_str(greenkey)
+        unique_id = jitdriver_sd.warmstate.get_unique_id(greenkey)
+        do_compile_loop(jitdriver_sd.index, unique_id, metainterp_sd,
+                        vloop.inputargs,
+                        get_deep_immutable_oplist(vloop.operations), vtoken,
+                        name=loopname, log=have_debug_prints(), memo=memo)
+    finally:
+        debug_stop("jit-backend")
+    metainterp_sd.stats.add_new_loop(vloop)
+    metainterp_sd.logger_ops.log_loop(vloop.inputargs, vloop.operations,
+                                      vtoken.number, "virtual entry", None,
+                                      name=loopname)
+    if metainterp_sd.warmrunnerdesc is not None:    # for tests
+        metainterp_sd.warmrunnerdesc.memory_manager.keep_loop_alive(vtoken)
+    record_loop_or_bridge(metainterp_sd, vloop)
+    token.virtual_entry = vtoken
+
 def propagate_original_jitcell_token(trace):
     for op in trace.operations:
         if op.getopnum() == rop.LABEL:
@@ -509,13 +685,8 @@ def send_loop_to_backend(greenkey, jitdriver_sd, metainterp_sd, loop, type,
     if vinfo is not None:
         vable = orig_inpargs[jitdriver_sd.index_of_virtualizable].getref_base()
         if jitdriver_sd.warmstate.callee_frame:
-            # callee_frame: before the patch below, loop.inputargs is already
-            # [red args..., vable fields...]: exactly the shape of the
-            # "virtual entry".  TODO(callee_frame): for a loop that starts
-            # at the portal entry, also compile an entry that skips the
-            # getfields (first allocating the Frame itself, later keeping
-            # it virtual) and store its token next to the normal one.
-            pass
+            compile_virtual_entry(greenkey, jitdriver_sd, metainterp_sd,
+                                  loop, vable, memo)
         patch_new_loop_to_load_virtualizable_fields(loop, jitdriver_sd, vable)
 
     original_jitcell_token = loop.original_jitcell_token
@@ -1112,6 +1283,15 @@ def compile_tmp_callback(cpu, jitdriver_sd, greenboxes, redargtypes,
     calls back the interpreter.  Used temporarily: a fully compiled
     version of the code may end up replacing it.
     """
+    jitcell_token = _compile_tmp_callback(cpu, jitdriver_sd, greenboxes,
+                                          redargtypes, memory_manager, False)
+    if has_virtual_entry(jitdriver_sd):
+        jitcell_token.virtual_entry = _compile_tmp_callback(
+            cpu, jitdriver_sd, greenboxes, redargtypes, memory_manager, True)
+    return jitcell_token
+
+def _compile_tmp_callback(cpu, jitdriver_sd, greenboxes, redargtypes,
+                          memory_manager, virtual_entry):
     jitcell_token = make_jitcell_token(jitdriver_sd)
     #
     # record the target of a temporary callback to the interpreter
@@ -1119,20 +1299,27 @@ def compile_tmp_callback(cpu, jitdriver_sd, greenboxes, redargtypes,
     #
     nb_red_args = jitdriver_sd.num_red_args
     assert len(redargtypes) == nb_red_args
-    inputargs = []
-    for kind in redargtypes:
-        if kind == history.INT:
-            box = InputArgInt()
-        elif kind == history.REF:
-            box = InputArgRef()
-        elif kind == history.FLOAT:
-            box = InputArgFloat()
-        else:
-            raise AssertionError
-        inputargs.append(box)
+    if virtual_entry:
+        # callee_frame: takes the fields, allocates the virtualizable
+        # and stores them all, since the interpreter reads them
+        vinfo = jitdriver_sd.virtualizable_info
+        jitcell_token.is_virtual_entry = True
+        inputargs, redboxes, staticboxes, _, preamble = (
+            _virtual_entry_prologue(jitdriver_sd, redargtypes))
+        newvable = redboxes[jitdriver_sd.index_of_virtualizable]
+        for j in range(len(staticboxes)):
+            preamble.append(ResOperation(rop.SETFIELD_GC,
+                                         [newvable, staticboxes[j]],
+                                         descr=vinfo.static_field_descrs[j]))
+    else:
+        inputargs = []
+        for kind in redargtypes:
+            inputargs.append(_inputarg_of_type(kind))
+        redboxes = inputargs
+        preamble = []
     k = jitdriver_sd.portal_runner_adr
     funcbox = history.ConstInt(adr2int(k))
-    callargs = [funcbox] + greenboxes + inputargs
+    callargs = [funcbox] + greenboxes + redboxes
     #
 
     jd = jitdriver_sd
@@ -1144,12 +1331,13 @@ def compile_tmp_callback(cpu, jitdriver_sd, greenboxes, redargtypes,
         finishargs = []
     #
     faildescr = jitdriver_sd.propagate_exc_descr
-    operations = [
+    guard_op = ResOperation(rop.GUARD_NO_EXCEPTION, [], descr=faildescr)
+    guard_op.setfailargs([])
+    operations = preamble + [
         call_op,
-        ResOperation(rop.GUARD_NO_EXCEPTION, [], descr=faildescr),
+        guard_op,
         ResOperation(rop.FINISH, finishargs, descr=jd.portal_finishtoken)
     ]
-    operations[1].setfailargs([])
     operations = get_deep_immutable_oplist(operations)
     cpu.compile_loop(inputargs, operations, jitcell_token, log=False)
 

@@ -350,6 +350,14 @@ class WarmEnterState(object):
             # to point to old_token.  Actually freeing old_token early
             # is a pointless optimization (it is tiny).
             old_token.record_jump_to(procedure_token)
+            # callee_frame: same for the "virtual entries", which all take
+            # the same arguments.  If the new procedure has none (see
+            # compile_virtual_entry()), callers keep using the old one
+            old_v = old_token.virtual_entry
+            new_v = procedure_token.virtual_entry
+            if old_v is not None and new_v is not None:
+                self.cpu.redirect_call_assembler(old_v, new_v)
+                old_v.record_jump_to(new_v)
 
     # ----------
 
@@ -716,10 +724,8 @@ class WarmEnterState(object):
         redargtypes = ''.join([kind[0] for kind in jd.red_args_types])
 
         def get_assembler_token(greenkey):
-            # callee_frame: TODO(callee_frame) add a sibling that
-            # returns the "virtual entry" token of the same cell (inputargs
-            # = red args without the vable + vable fields), or None if it
-            # was not compiled yet.
+            # callee_frame: the "virtual entry" of the result, if any, is
+            # its 'virtual_entry' attribute (see compile_virtual_entry())
             cell = JitCell.ensure_jit_cell_at_key(greenkey)
             procedure_token = cell.get_procedure_token()
             if procedure_token is None:

@@ -94,19 +94,21 @@ class OptVirtualize(optimizer.Optimization):
         if (isinstance(descr, JitCellToken) and
                 descr.outermost_jitdriver_sd is not None and
                 descr.outermost_jitdriver_sd.warmstate.callee_frame):
-            # callee_frame: today the vable argument is a virtual Frame that
-            # Optimizer._emit_operation() forces (new_with_vtable +
-            # setfields) just before the call.  TODO(callee_frame):
-            #  * if the vable argument is virtual (getptrinfo(arg).is_virtual())
-            #    AND it is not used after this op (pre-scan the trace, or
-            #    keep it virtual and force on later use), emit instead
-            #        CALL_ASSEMBLER(<red args minus vable>, <vable fields
-            #                       in vinfo order>, <non-vable fields>,
-            #                       descr=<virtual entry token>)
-            #    taking the field values from the virtual's info
-            #    (cf. virtualstate.VirtualState.make_inputargs);
-            #  * the token comes from warmstate (get_assembler_token,
-            #    second entry); fall back to emit(op) if there is none.
+            # callee_frame: today the vable argument is a virtual Frame
+            # that Optimizer._emit_operation() forces (new_with_vtable +
+            # setfields) just before the call.  TODO(callee_frame): when
+            #  * descr.virtual_entry is not None,
+            #  * the vable argument (index_of_virtualizable of
+            #    descr.outermost_jitdriver_sd) is virtual and its info.descr
+            #    is vinfo.vable_size_descr, and
+            #  * the Frame is not used after this op (no later op or
+            #    failargs: see test_caller_reads_callee_frame_after_call),
+            # replace op (replace_op_with) by a CALL_ASSEMBLER to
+            # descr.virtual_entry whose args are
+            #    [red args without the vable]
+            #    + [the virtual's field for each vinfo.static_field_descrs]
+            #    + [same for vinfo.virtual_entry_extra_descrs]
+            # (a field that was never set is a zero constant).
             pass
         return self.emit(op)
     optimize_CALL_ASSEMBLER_R = optimize_CALL_ASSEMBLER_I

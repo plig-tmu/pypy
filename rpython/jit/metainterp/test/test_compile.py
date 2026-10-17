@@ -141,6 +141,7 @@ def test_compile_tmp_callback():
         propagate_exc_descr = compile.PropagateExceptionDescr()
         num_red_args = 2
         result_type = INT
+        virtualizable_info = None
     #
     loop_token = compile_tmp_callback(cpu, FakeJitDriverSD(),
                                       [ConstInt(12), ConstInt(34)], "ii")
