@@ -1481,7 +1481,7 @@ class LLFrame(object):
             jd = descr.outermost_jitdriver_sd
             assert jd is not None, ("call_assembler(): the loop_token needs "
                                     "to have 'outermost_jitdriver_sd'")
-            if jd.index_of_virtualizable != -1:
+            if jd.index_of_virtualizable != -1 and not descr.is_virtual_entry:
                 vable = args[jd.index_of_virtualizable]
             else:
                 vable = lltype.nullptr(llmemory.GCREF.TO)

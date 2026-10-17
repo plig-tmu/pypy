@@ -686,12 +686,11 @@ class GcRewriterAssembler(object):
         assert isinstance(descr, JitCellToken)
         jd = descr.outermost_jitdriver_sd
         args = [frame]
-        # callee_frame: TODO(callee_frame): for a CALL_ASSEMBLER to a "virtual entry"
-        # token there is no vable among the args (the fields are stored
-        # into the jitframe by the loop above, via _ll_initial_locs of
-        # that token), so pass only [frame]: the backend then uses vloc=0,
-        # which assembler_call_helper() ignores anyway.
-        if jd and jd.index_of_virtualizable >= 0:
+        # callee_frame: a "virtual entry" takes no vable argument (its
+        # fields are stored into the jitframe by the loop above); the
+        # backend then passes vloc=0, ignored by assembler_call_helper()
+        if (jd and jd.index_of_virtualizable >= 0 and
+                not descr.is_virtual_entry):
             args = [frame, arglist[jd.index_of_virtualizable]]
         else:
             args = [frame]
