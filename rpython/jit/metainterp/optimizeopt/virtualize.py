@@ -108,7 +108,9 @@ class OptVirtualize(optimizer.Optimization):
             #    [red args without the vable]
             #    + [the virtual's field for each vinfo.static_field_descrs]
             #    + [same for vinfo.virtual_entry_extra_descrs]
-            # (a field that was never set is a zero constant).
+            # (a field that was never set is a zero constant).  The
+            # KEEPALIVE that pyjitpl puts after the call must not keep the
+            # Frame either, or it is forced (allocated) right after the call.
             pass
         return self.emit(op)
     optimize_CALL_ASSEMBLER_R = optimize_CALL_ASSEMBLER_I

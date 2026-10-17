@@ -82,15 +82,17 @@ class CalleeFrameTests:
                      if rop.is_call_assembler(op.getopnum()))
 
     def frames_allocated_for_call_assembler(self):
-        """Number of call_assembler ops that get an argument produced by a
-        new_with_vtable in the same trace (= caller-side Frame allocation)."""
+        """Number of call_assembler or keepalive ops that get an argument
+        produced by a new_with_vtable in the same trace (= caller-side
+        Frame allocation; the keepalive after the call would force it too)."""
         count = 0
         for loop in get_stats().get_all_loops():
             news = set()
             for op in loop.operations:
                 if op.getopnum() == rop.NEW_WITH_VTABLE:
                     news.add(op)
-                elif rop.is_call_assembler(op.getopnum()):
+                elif (rop.is_call_assembler(op.getopnum()) or
+                        op.getopnum() == rop.KEEPALIVE):
                     if [arg for arg in op.getarglist() if arg in news]:
                         count += 1
         return count
