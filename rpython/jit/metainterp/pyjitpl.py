@@ -1122,6 +1122,14 @@ class MIFrame(object):
     def _nonstandard_virtualizable(self, pc, box, fielddescr):
         # returns True if 'box' is actually not the "standard" virtualizable
         # that is stored in metainterp.virtualizable_boxes[-1]
+        if (self.metainterp.jitdriver_sd.virtualizable_info is not None and
+                box is self.metainterp.virtualizable_boxes[-1]):
+            # checked before the heapcache, which assumes that a box
+            # allocated in the trace is not the standard virtualizable;
+            # with callee_frame it can be, in a bridge out of a virtual body
+            if box is self.metainterp.forced_virtualizable:
+                self.metainterp.forced_virtualizable = None
+            return False
         if self.metainterp.heapcache.is_known_nonstandard_virtualizable(box):
             self.metainterp.staticdata.profiler.count_ops(rop.PTR_EQ, Counters.HEAPCACHED_OPS)
             return True
