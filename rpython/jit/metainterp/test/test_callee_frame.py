@@ -65,6 +65,29 @@ def portal(code, frame):
 def main(code, n):
     return portal(code, Frame(n))
 
+# a second toy whose callee contains a loop: code 1 sums n, n-1, ..., 1
+# into frame.acc; code 0 calls it n times
+
+ldriver = JitDriver(greens=['code'], reds=['frame'], virtualizables=['frame'])
+
+def lportal(code, frame):
+    while True:
+        ldriver.jit_merge_point(code=code, frame=frame)
+        n = frame.n
+        if code == 1:
+            if n <= 0:
+                return frame.acc
+            frame.acc += n
+            frame.n = n - 1
+            ldriver.can_enter_jit(code=code, frame=frame)
+        else:
+            if n == 0:
+                return 0
+            return lportal(1, Frame(n % 5)) + lportal(0, Frame(n - 1))
+
+def lmain(n):
+    return lportal(0, Frame(n))
+
 
 class CalleeFrameTests:
 
@@ -219,6 +242,26 @@ class CalleeFrameTests:
         # at the head of the virtual entry
         for n in [0, 1, 2, 5, 10, 15]:
             assert self.call_virtual_entry(vtoken, n, 0) == main(0, n)
+
+    def is_loop_label(self, label):
+        # the first LABEL of a loop is in the target_tokens of the loop
+        target_tokens = label.original_jitcell_token.target_tokens
+        return target_tokens is not None and label in target_tokens
+
+    def test_virtual_entry_into_loop(self):
+        for callee_frame in [0, 1, 2]:
+            res = self.meta_interp(lmain, [40], inline=True,
+                                   max_unroll_recursion=1,
+                                   callee_frame=callee_frame)
+            assert res == lmain(40)
+        # the callers pass the fields to the virtual entry of the loop,
+        # which jumps to the first LABEL of the loop
+        assert self.count_call_assembler() > 0
+        assert self.frames_allocated_for_call_assembler() == 0
+        [vtoken] = [vtoken for vtoken in self.virtual_entries()
+                           if self.is_loop_label(vtoken.virtual_entry_label)]
+        for n in [0, 1, 5, 9]:
+            assert self.call_virtual_entry(vtoken, n, 7) == 7 + n * (n + 1) // 2
 
     def test_virtual_entry_slow_paths(self):
         self.check_slow_paths(1)

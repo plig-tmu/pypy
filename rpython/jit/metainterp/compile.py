@@ -457,8 +457,11 @@ def patch_new_loop_to_load_virtualizable_fields(loop, jitdriver_sd, vable,
             box.set_forwarded(extra_ops[-1])
         arrayindex += 1
     assert i == len(inputargs)
-    if label_token is not None:
-        # callee_frame: where the virtual entry jumps to
+    if label_token is not None and not (
+            loop.operations and loop.operations[0].getopnum() == rop.LABEL
+            and loop.operations[0].getdescr() is label_token):
+        # callee_frame: where the virtual entry jumps to (a loop has one
+        # already, see virtual_entry_label())
         emit_op(extra_ops, ResOperation(rop.LABEL, inputargs,
                                         descr=label_token))
     for op in loop.operations:
@@ -529,24 +532,41 @@ def has_virtual_entry(jitdriver_sd):
             jitdriver_sd.warmstate.callee_frame > 0)
 
 def virtual_entry_label(jitdriver_sd, loop, vable):
-    """callee_frame: a TargetToken for the LABEL that
+    """callee_frame: the TargetToken of the LABEL for the virtual entry
+    to jump to, which takes the red args and the vable fields: the first
+    LABEL of a loop, or for a procedure one that
     patch_new_loop_to_load_virtualizable_fields() puts right after its
-    getfields, for the virtual entry to jump to; or None if 'loop' gets no
-    virtual entry: if the vable is not exactly of the class declaring
-    _virtualizable_, or if the loop contains a LABEL already.
+    getfields.  None if 'loop' gets no virtual entry: if the vable is not
+    exactly of the class declaring _virtualizable_, or if a procedure
+    contains a LABEL already.
     """
     vinfo = jitdriver_sd.virtualizable_info
     token = loop.original_jitcell_token
     if (token.virtual_entry is not None or not has_virtual_entry(jitdriver_sd)
             or not vinfo.is_exact_vtype(vable)):
         return None
+    start_label = _start_label(loop)
+    if start_label is not None:
+        # a loop: its first operation is the LABEL of compile_loop(),
+        # with all the inputargs, which is what the virtual entry needs
+        descr = start_label.getdescr()
+        assert isinstance(descr, TargetToken)
+        return descr
     for op in loop.operations:
         if op.getopnum() == rop.LABEL:
-            # ponytail: loops are not handled (an extra LABEL in front of
-            # the existing one is untested); callers keep the virtual
-            # entry of the tmp callback (through the interpreter)
             return None
     return TargetToken(token, original_jitcell_token=token)
+
+def _start_label(loop):
+    if not loop.operations:
+        return None
+    op = loop.operations[0]
+    if op.getopnum() != rop.LABEL or op.numargs() != len(loop.inputargs):
+        return None
+    for i in range(op.numargs()):
+        if op.getarg(i) is not loop.inputargs[i]:
+            return None
+    return op
 
 def compile_virtual_entry(greenkey, jitdriver_sd, metainterp_sd, redkinds,
                           label_token, vable, memo):
