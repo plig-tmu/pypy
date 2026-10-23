@@ -1,7 +1,7 @@
 from rpython.jit.metainterp import jitprof, resume, compile
 from rpython.jit.metainterp.executor import execute_nonspec_const
 from rpython.jit.metainterp.history import (
-    Const, ConstInt, CONST_NULL, new_ref_dict,
+    Const, ConstInt, CONST_NULL, new_ref_dict, JitCellToken,
     CONST_FALSE as CONST_0,
     CONST_TRUE as CONST_1,
     )
@@ -13,6 +13,8 @@ from rpython.jit.metainterp.optimizeopt.bridgeopt import (
 from rpython.jit.metainterp.resoperation import (
     rop, AbstractResOp, GuardResOp, OpHelpers,
     get_opclass_memo, ResOpWithDescr)
+from rpython.jit.metainterp.opencoder import (
+    TopDownSnapshotIterator, untag, TAGBOX)
 from .info import getrawptrinfo, getptrinfo
 from rpython.jit.metainterp.optimizeopt import info
 from rpython.jit.metainterp.optimize import InvalidLoop
@@ -282,6 +284,11 @@ class Optimizer(Optimization):
         self._last_guard_op = None
 
         self.can_replace_guards = True
+
+        # callee_frame: see find_dead_callee_frames()
+        self.callee_frame_dead = []
+        self.callee_frame_count = 0
+        self.callee_frame_dropped = {}
 
         self.set_optimizations(optimizations)
         self.setup()
@@ -588,6 +595,10 @@ class Optimizer(Optimization):
             self.log_operations_intbounds.log_inputargs(trace.inputargs)
         #deadranges = trace.get_dead_ranges()
         self.call_pure_results = call_pure_results
+        if (self.jitdriver_sd is not None and
+                self.jitdriver_sd.warmstate.callee_frame):
+            self.callee_frame_dead = self.find_dead_callee_frames(trace)
+            self.callee_frame_count = 0
         last_op = None
         i = 0
         while not trace.done():
@@ -618,6 +629,82 @@ class Optimizer(Optimization):
 
         return (BasicLoopInfo(trace.inputargs, self.quasi_immutable_deps, last_op),
                 self._newoperations)
+
+    def find_dead_callee_frames(self, trace):
+        """callee_frame: for each CALL_ASSEMBLER of 'trace', in order,
+        whether its vable argument is a Frame allocated in the trace that
+        is neither stored anywhere nor used after the call (by an
+        operation or by resume data), apart from the KEEPALIVE that
+        pyjitpl puts after the call.  Only then can OptVirtualize pass
+        the fields of the Frame instead of the Frame itself.  Reads the
+        whole trace and then rewinds it.
+        """
+        dead = []
+        frames = {}       # vable of a CALL_ASSEMBLER -> its index in 'dead'
+        allocated = {}
+        escaped = {}
+        pos, index, count = trace.pos, trace._index, trace._count
+        while not trace.done():
+            op = trace.next()
+            opnum = op.getopnum()
+            if opnum == rop.NEW_WITH_VTABLE:
+                allocated[op] = None
+                continue
+            if opnum == rop.KEEPALIVE and op.getarg(0) in frames:
+                continue
+            vable_index = -1
+            if rop.is_call_assembler(opnum):
+                descr = op.getdescr()
+                if isinstance(descr, JitCellToken):
+                    jd = descr.outermost_jitdriver_sd
+                    if jd is not None:
+                        vable_index = jd.index_of_virtualizable
+            for i in range(op.numargs()):
+                arg = op.getarg(i)
+                if arg in frames:
+                    dead[frames[arg]] = False
+                if i == vable_index:
+                    continue
+                if i == 0 and (opnum == rop.SETFIELD_GC or
+                               rop.is_getfield(opnum) or
+                               opnum == rop.GUARD_CLASS or
+                               opnum == rop.GUARD_NONNULL_CLASS or
+                               opnum == rop.GUARD_NONNULL or
+                               opnum == rop.GUARD_ISNULL):
+                    continue
+                escaped[arg] = None
+            if rop.is_guard(opnum):
+                assert isinstance(op, GuardResOp)
+                self._callee_frames_in_snapshot(trace, op.rd_resume_position,
+                                                frames, dead)
+            if rop.is_call_assembler(opnum):
+                ok = False
+                if vable_index >= 0:
+                    vable = op.getarg(vable_index)
+                    ok = (vable in allocated and vable not in escaped and
+                          vable not in frames)
+                    frames[vable] = len(dead)
+                dead.append(ok)
+        trace.pos, trace._index, trace._count = pos, index, count
+        return dead
+
+    def _callee_frames_in_snapshot(self, trace, resume_position, frames,
+                                   dead):
+        it = TopDownSnapshotIterator(trace.trace, resume_position)
+        for item in it.iter_vable_array():
+            self._callee_frame_in_snapshot(trace, item, frames, dead)
+        for item in it.iter_vref_array():
+            self._callee_frame_in_snapshot(trace, item, frames, dead)
+        for snapshot_index in it:
+            for item in it.iter_array(snapshot_index):
+                self._callee_frame_in_snapshot(trace, item, frames, dead)
+
+    def _callee_frame_in_snapshot(self, trace, item, frames, dead):
+        tag, v = untag(item)
+        if tag == TAGBOX:
+            box = trace._get(v)
+            if box in frames:
+                dead[frames[box]] = False
 
     def _clean_optimization_info(self, lst):
         for op in lst:

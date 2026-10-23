@@ -1,8 +1,9 @@
 """Acceptance tests for the experimental 'callee_frame' JIT parameter.
 
-Baseline tests pass today; the xfail(strict=True) ones describe the
-targets and start passing (=> XPASS => failure) once implemented, at
-which point remove the marker.
+The toy is fib over a virtualizable Frame; the tests check the results
+with the flag off and on, the virtual entry and the virtual body of the
+callee, and that callers do not allocate the Frame they pass to
+call_assembler.
 
     python2 pytest.py rpython/jit/metainterp/test/test_callee_frame.py
 """
@@ -12,10 +13,6 @@ from rpython.jit.metainterp.test.support import LLJitMixin
 from rpython.jit.metainterp.resoperation import rop
 from rpython.jit.metainterp.warmspot import get_stats
 
-fields_passed = py.test.mark.xfail(strict=True,
-    reason="callee_frame: fields not passed to call_assembler yet")
-frame_virtual = py.test.mark.xfail(strict=True,
-    reason="callee_frame: needs the caller-side rewrite (callee_frame=2)")
 
 
 # ---------- the toy interpreter: fib(n) with one virtualizable Frame ----------
@@ -124,7 +121,7 @@ class CalleeFrameTests:
             count += len([op for op in frames if op not in escaped])
         return count
 
-    # ---- baseline: pass today, must keep passing ----
+    # ---- baseline ----
 
     def test_toy_uses_call_assembler(self):
         assert self.run(0, 15, 0) == main(0, 15)
@@ -164,6 +161,32 @@ class CalleeFrameTests:
                                max_unroll_recursion=1, callee_frame=1)
         assert res == main2(0, 12) == 144
         assert self.count_call_assembler() > 0
+        assert self.frames_allocated_for_call_assembler() > 0
+
+    def test_caller_stores_callee_frame(self):
+        # the Frame is stored into another (virtual) object before the
+        # call and read through it afterwards: the caller must keep
+        # passing the Frame itself
+        class Holder(object):
+            pass
+        def portal3(code, frame):
+            driver.jit_merge_point(code=code, frame=frame)
+            n = frame.n
+            frame.acc = n
+            if n < 2:
+                return n
+            holder = Holder()
+            holder.frame = Frame(n - 1)
+            a = portal3(code, holder.frame)
+            b = portal3(code, Frame(n - 2))
+            return a + b + holder.frame.acc
+        def main3(code, n):
+            return portal3(code, Frame(n))
+        res = self.meta_interp(main3, [0, 12], inline=True,
+                               max_unroll_recursion=1, callee_frame=2)
+        assert res == main3(0, 12)
+        assert self.count_call_assembler() > 0
+        assert self.frames_allocated_for_call_assembler() > 0
 
     # ---- the virtual entry itself (callee side) ----
 
@@ -311,36 +334,31 @@ class CalleeFrameTests:
         for ops in mine:
             assert self.own_frame_allocs(ops) == 0
 
-    # ---- target: no caller-side Frame allocation for call_assembler ----
+    # ---- no caller-side Frame allocation for call_assembler ----
 
-    @fields_passed
     def test_no_frame_alloc_before_call_assembler(self):
         assert self.run(0, 15, 1) == main(0, 15)
         assert self.count_call_assembler() > 0
         assert self.frames_allocated_for_call_assembler() == 0
 
-    # ---- target: Frame stays virtual in the callee; slow paths correct ----
+    # ---- the Frame stays virtual in the callee; slow paths correct ----
 
-    @frame_virtual
     def test_frame_virtual_in_callee(self):
         assert self.run(0, 15, 2) == main(0, 15)
         assert self.count_call_assembler() > 0
         assert self.frame_allocs_except_escapes() == 0
 
-    @frame_virtual
     def test_guard_failure_in_callee(self):
         # code 3 takes a rare branch at n == 3 and later reads frame.acc:
         # the guard failure must rebuild the Frame with the right fields
         assert self.run(3, 15, 2) == main(3, 15)
         assert self.frame_allocs_except_escapes() == 0
 
-    @frame_virtual
     def test_force_materializes_frame(self):
         # peek() reads the forced Frame; its result is part of the result
         assert self.run(1, 15, 2) == main(1, 15)
         assert self.frame_allocs_except_escapes() == 0
 
-    @frame_virtual
     def test_exception_in_callee(self):
         assert self.run(2, 15, 2) == main(2, 15)
         assert self.frame_allocs_except_escapes() == 0

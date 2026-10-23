@@ -484,6 +484,7 @@ class FakeJitDriverStaticData(object):
     vec = False
     class warmstate:
         pureop_historylength = 16
+        callee_frame = 0
 
     virtualizable_info = None
 

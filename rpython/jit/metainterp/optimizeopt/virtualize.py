@@ -91,28 +91,60 @@ class OptVirtualize(optimizer.Optimization):
 
     def optimize_CALL_ASSEMBLER_I(self, op):
         descr = op.getdescr()
+        k = self.optimizer.callee_frame_count
+        self.optimizer.callee_frame_count = k + 1
         if (isinstance(descr, JitCellToken) and
                 descr.outermost_jitdriver_sd is not None and
                 descr.outermost_jitdriver_sd.warmstate.callee_frame):
-            # callee_frame: today the vable argument is a virtual Frame
-            # that Optimizer._emit_operation() forces (new_with_vtable +
-            # setfields) just before the call.  TODO(callee_frame): when
-            #  * descr.virtual_entry is not None,
-            #  * the vable argument (index_of_virtualizable of
-            #    descr.outermost_jitdriver_sd) is virtual and its info.descr
-            #    is vinfo.vable_size_descr, and
-            #  * the Frame is not used after this op (no later op or
-            #    failargs: see test_caller_reads_callee_frame_after_call),
-            # replace op (replace_op_with) by a CALL_ASSEMBLER to
-            # descr.virtual_entry whose args are
-            #    [red args without the vable]
-            #    + [the virtual's field for each vinfo.static_field_descrs]
-            #    + [same for vinfo.virtual_entry_extra_descrs]
-            # (a field that was never set is a zero constant).  The
-            # KEEPALIVE that pyjitpl puts after the call must not keep the
-            # Frame either, or it is forced (allocated) right after the call.
-            pass
+            dead = self.optimizer.callee_frame_dead
+            if k < len(dead) and dead[k]:
+                newop = self._call_virtual_entry(op, descr)
+                if newop is not None:
+                    return self.emit(newop)
         return self.emit(op)
+
+    def _call_virtual_entry(self, op, descr):
+        # callee_frame: the vable argument is a virtual Frame that dies
+        # here (see find_dead_callee_frames()): instead of forcing it,
+        # pass its fields to the "virtual entry" of the callee, which
+        # allocates its own Frame (or keeps it virtual)
+        ventry = descr.virtual_entry
+        if ventry is None:
+            return None
+        jd = descr.outermost_jitdriver_sd
+        vinfo = jd.virtualizable_info
+        index = jd.index_of_virtualizable
+        vable = get_box_replacement(op.getarg(index))
+        opinfo = getptrinfo(vable)
+        if (opinfo is None or not opinfo.is_virtual() or
+                not isinstance(opinfo, info.InstancePtrInfo) or
+                opinfo.descr is not vinfo.vable_size_descr):
+            return None
+        args = []
+        for i in range(op.numargs()):
+            if i != index:
+                args.append(op.getarg(i))
+        for fielddescr in vinfo.static_field_descrs:
+            args.append(self._virtual_field(opinfo, fielddescr))
+        for fielddescr in vinfo.virtual_entry_extra_descrs:
+            args.append(self._virtual_field(opinfo, fielddescr))
+        self.optimizer.callee_frame_dropped[vable] = None
+        return self.replace_op_with(op, op.getopnum(), args=args,
+                                    descr=ventry)
+
+    def _virtual_field(self, opinfo, fielddescr):
+        box = opinfo.getfield(fielddescr)
+        if box is None:
+            return self.optimizer.new_const(fielddescr)
+        return get_box_replacement(box)
+
+    def optimize_KEEPALIVE(self, op):
+        # callee_frame: the KEEPALIVE that pyjitpl puts after
+        # CALL_ASSEMBLER would force a Frame that we did not pass
+        if get_box_replacement(op.getarg(0)) in self.optimizer.callee_frame_dropped:
+            return
+        return self.emit(op)
+
     optimize_CALL_ASSEMBLER_R = optimize_CALL_ASSEMBLER_I
     optimize_CALL_ASSEMBLER_F = optimize_CALL_ASSEMBLER_I
     optimize_CALL_ASSEMBLER_N = optimize_CALL_ASSEMBLER_I
