@@ -1390,7 +1390,7 @@ def _compile_tmp_callback(cpu, jitdriver_sd, greenboxes, redargtypes,
         vinfo = jitdriver_sd.virtualizable_info
         jitcell_token.is_virtual_entry = True
         inputargs, redboxes, staticboxes, _, preamble = (
-            _virtual_entry_prologue(jitdriver_sd, redargtypes))
+            _virtual_entry_prologue(jitdriver_sd, list(redargtypes)))
         newvable = redboxes[jitdriver_sd.index_of_virtualizable]
         for j in range(len(staticboxes)):
             preamble.append(ResOperation(rop.SETFIELD_GC,
