@@ -572,7 +572,16 @@ def compile_virtual_entry(greenkey, jitdriver_sd, metainterp_sd, redkinds,
                           label_token, vable, memo):
     """callee_frame: compile the "virtual entry" of the procedure that
     contains 'label_token' (see virtual_entry_label()) and store it as
-    its 'virtual_entry'.  It is a small loop: see _virtual_entry_prologue()
+    its 'virtual_entry'."""
+    token = label_token.original_jitcell_token
+    token.virtual_entry = _compile_trampoline(greenkey, jitdriver_sd,
+                                              metainterp_sd, redkinds,
+                                              label_token, vable, memo)
+
+def _compile_trampoline(greenkey, jitdriver_sd, metainterp_sd, redkinds,
+                        label_token, vable, memo):
+    """callee_frame: compile a virtual entry that jumps to 'label_token'
+    and return its JitCellToken.  It is a small loop: see _virtual_entry_prologue()
     for its inputargs; it allocates the vable, fills in the extra fields,
     reads the array items from the arrays, and jumps to the LABEL with the
     same values that the getfields of the normal entry produce.  The
@@ -594,12 +603,11 @@ def compile_virtual_entry(greenkey, jitdriver_sd, metainterp_sd, redkinds,
             jumpargs.append(item)
     operations.append(ResOperation(rop.JUMP, jumpargs, descr=label_token))
     #
-    token = label_token.original_jitcell_token
     vtoken = _send_extra_loop_to_backend(greenkey, jitdriver_sd, metainterp_sd,
                                          'virtual entry', inputargs,
                                          operations, None, memo)
     vtoken.virtual_entry_label = label_token
-    token.virtual_entry = vtoken
+    return vtoken
 
 def _send_extra_loop_to_backend(greenkey, jitdriver_sd, metainterp_sd, name,
                                 inputargs, operations, quasi_immutable_deps,
@@ -722,9 +730,45 @@ def compile_virtual_body(metainterp, greenkey, token, vable):
                                         'virtual body', info.inputargs,
                                         newops, info.quasi_immutable_deps,
                                         metainterp.box_names_memo)
+    vbody.is_virtual_body = True
+    vbody.virtual_body_greenkey = greenkey
+    # a second trampoline into the procedure, for abandon_virtual_body()
+    redkinds = [kind[0] for kind in jitdriver_sd.red_args_types]
+    fallback = _compile_trampoline(greenkey, jitdriver_sd, metainterp_sd,
+                                   redkinds, ventry.virtual_entry_label,
+                                   vable, metainterp.box_names_memo)
+    vbody.virtual_body_fallback = fallback
+    vbody.record_jump_to(fallback)
     metainterp_sd.cpu.redirect_call_assembler(ventry, vbody)
     ventry.record_jump_to(vbody)
     ventry.virtual_body = vbody
+
+def abandon_virtual_body(metainterp_sd, jitdriver_sd, vbody):
+    """callee_frame: called when a guard of the virtual body 'vbody' (or
+    of one of its bridges) is about to get a bridge.  The bridges of a
+    virtual body are traced after those of its procedure.  If the virtual
+    body has no bridge yet and the function cannot be inlined any more
+    because a trace was too long, its bridges would call the function
+    through call_assembler at every level, while those of the procedure
+    inline it: then stop using the virtual body and send its callers to
+    the procedure again.  Returns True if it did that.
+    """
+    if vbody.virtual_body_abandoned:
+        return True
+    if vbody.virtual_body_has_bridges:
+        return False
+    if not jitdriver_sd.warmstate.inlining_disabled_by_trace_too_long(
+            vbody.virtual_body_greenkey):
+        return False
+    debug_start("jit-callee-frame")
+    debug_print("abandon virtual body",
+                jitdriver_sd.warmstate.get_location_str(
+                    vbody.virtual_body_greenkey))
+    debug_stop("jit-callee-frame")
+    vbody.virtual_body_abandoned = True
+    metainterp_sd.cpu.redirect_call_assembler(vbody,
+                                              vbody.virtual_body_fallback)
+    return True
 
 def propagate_original_jitcell_token(trace):
     for op in trace.operations:
@@ -977,7 +1021,9 @@ class AbstractResumeGuardDescr(ResumeDescr):
 
     def handle_fail(self, deadframe, metainterp_sd, jitdriver_sd):
         if (self.must_compile(deadframe, metainterp_sd, jitdriver_sd)
-                and not rstack.stack_almost_full()):
+                and not rstack.stack_almost_full()
+                and not self._abandons_virtual_body(metainterp_sd,
+                                                    jitdriver_sd)):
             self.start_compiling()
             try:
                 self._trace_and_compile_from_bridge(deadframe, metainterp_sd,
@@ -992,6 +1038,15 @@ class AbstractResumeGuardDescr(ResumeDescr):
                 assert isinstance(self, ResumeGuardDescr)
                 resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
         assert 0, "unreachable"
+
+    def _abandons_virtual_body(self, metainterp_sd, jitdriver_sd):
+        # callee_frame: see abandon_virtual_body()
+        if jitdriver_sd.warmstate.callee_frame < 2:
+            return False
+        loop_token = self.rd_loop_token.loop_token_wref()
+        if loop_token is None or not loop_token.is_virtual_body:
+            return False
+        return abandon_virtual_body(metainterp_sd, jitdriver_sd, loop_token)
 
     def _trace_and_compile_from_bridge(self, deadframe, metainterp_sd,
                                        jitdriver_sd):
@@ -1085,6 +1140,8 @@ class AbstractResumeGuardDescr(ResumeDescr):
                                self, inputargs, new_loop.operations,
                                new_loop.original_jitcell_token,
                                metainterp.box_names_memo)
+        if new_loop.original_jitcell_token.is_virtual_body:
+            new_loop.original_jitcell_token.virtual_body_has_bridges = True
         record_loop_or_bridge(metainterp.staticdata, new_loop)
 
     def make_a_counter_per_value(self, guard_value_op, index):

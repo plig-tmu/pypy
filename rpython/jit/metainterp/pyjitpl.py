@@ -1389,7 +1389,10 @@ class MIFrame(object):
         warmrunnerstate = targetjitdriver_sd.warmstate
         assembler_call = False
         if warmrunnerstate.inlining:
-            if warmrunnerstate.can_inline_callable(greenboxes):
+            if (warmrunnerstate.can_inline_callable(greenboxes) or
+                    (self.metainterp.tracing_from_virtual_body() and
+                     warmrunnerstate.can_inline_callable_in_virtual_body(
+                         greenboxes))):
                 # We've found a potentially inlinable function; now we need to
                 # see if it's already on the stack. In other words: are we about
                 # to enter recursion? If so, we don't want to inline the
@@ -1420,7 +1423,7 @@ class MIFrame(object):
                     if have_debug_prints():
                         loc = targetjitdriver_sd.warmstate.get_location_str(greenboxes)
                         debug_print("recursive function (not inlined):", loc)
-                    warmrunnerstate.dont_trace_here(greenboxes)
+                    warmrunnerstate.recursion_limit_reached(greenboxes)
                 else:
                     return self.metainterp.perform_call(portal_code, allboxes,
                                 greenkey=greenboxes)
@@ -2414,6 +2417,7 @@ class MetaInterp(object):
     exported_state = None
     last_exc_box = None
     _last_op = None
+    resumekey_original_loop_token = None
 
     def __init__(self, staticdata, jitdriver_sd, force_finish_trace=False):
         self.staticdata = staticdata
@@ -2920,6 +2924,18 @@ class MetaInterp(object):
         except SwitchToBlackhole as stb:
             self.run_blackhole_interp_to_cancel_tracing(stb)
         assert False, "should always raise"
+
+    def tracing_from_virtual_body(self):
+        """callee_frame: are we tracing a bridge out of a virtual body
+        (or out of one of its bridges)?  The virtual body is compiled
+        next to its procedure and grows its own bridges.  By the time they
+        are traced, the procedure's bridges have usually marked the
+        function JC_DONT_TRACE_HERE (max_unroll_recursion), which would
+        stop them from inlining any recursive call; the recursion count of
+        _opimpl_recursive_call() still limits them.
+        """
+        token = self.resumekey_original_loop_token
+        return token is not None and token.is_virtual_body
 
     def handle_guard_failure(self, resumedescr, deadframe):
         debug_start('jit-tracing')

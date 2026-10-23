@@ -88,6 +88,36 @@ def lportal(code, frame):
 def lmain(n):
     return lportal(0, Frame(n))
 
+# a third toy shaped like RPyYARV's interpreter: a can_enter_jit in the
+# portal (code 1 is a loop) lets recursive calls be inlined; code 0 is fib.
+# rmain() runs leaves first, so that the procedure is fib's base case and
+# its bridges do the recursion, as in RPyYARV.
+
+rdriver = JitDriver(greens=['code'], reds=['frame'], virtualizables=['frame'])
+
+def rportal(code, frame):
+    while True:
+        rdriver.jit_merge_point(code=code, frame=frame)
+        n = frame.n
+        if code == 1:
+            if n <= 0:
+                return frame.acc
+            frame.acc += n
+            frame.n = n - 1
+            rdriver.can_enter_jit(code=code, frame=frame)
+        else:
+            if n < 2:
+                return n
+            return rportal(0, Frame(n - 1)) + rportal(0, Frame(n - 2))
+
+def rmain(n):
+    i = 0
+    r = 0
+    while i < 30:
+        r += rportal(0, Frame(1))
+        i += 1
+    return r + rportal(0, Frame(n)) + rportal(1, Frame(3))
+
 
 class CalleeFrameTests:
 
@@ -358,6 +388,78 @@ class CalleeFrameTests:
 
     def test_virtual_body_slow_paths(self):
         self.check_slow_paths(2)
+
+    def test_virtual_body_bridges_inline_recursion(self):
+        # the bridges of the procedure reach max_unroll_recursion and mark
+        # fib JC_DONT_TRACE_HERE before the virtual body grows its own
+        # bridges; those must still inline recursive calls
+        def inlined_levels(ops):
+            # each inlined level of fib checks n < 2
+            return len([op for op in ops if op.getopnum() == rop.INT_LT])
+        bridges, undo = self.collect_bridges()
+        try:
+            res = self.meta_interp(rmain, [20], inline=True,
+                                   max_unroll_recursion=3, callee_frame=2)
+        finally:
+            undo()
+        assert res == rmain(20)
+        bodies = [vtoken.virtual_body for vtoken in self.virtual_entries()]
+        procedure = [ops for token, ops in bridges if token not in bodies]
+        body = [ops for token, ops in bridges if token in bodies]
+        assert max([inlined_levels(ops) for ops in procedure]) > 1
+        assert max([inlined_levels(ops) for ops in body]) > 1
+
+    def test_virtual_body_abandoned(self):
+        # once inlining of fib is disabled because a trace was too long,
+        # the virtual body stops growing bridges and sends its callers to
+        # the procedure through a second trampoline
+        def rleaves(code):
+            i = 0
+            r = 0
+            while i < 30:
+                r += rportal(code, Frame(1))
+                i += 1
+            return r
+        bridges, undo = self.collect_bridges()
+        try:
+            assert self.meta_interp(rleaves, [0], inline=True,
+                                    callee_frame=2) == rleaves(0)
+            [vtoken] = [vtoken for vtoken in self.virtual_entries()
+                               if vtoken.virtual_body is not None]
+            body = vtoken.virtual_body
+            assert not body.virtual_body_abandoned
+            jd = get_stats().metainterp_sd.jitdrivers_sd[0]
+            jd.warmstate.disable_noninlinable_function(
+                body.virtual_body_greenkey)
+            for i in range(20):
+                assert self.call_virtual_entry(vtoken, 10, 0) == 55
+        finally:
+            undo()
+        assert body.virtual_body_abandoned
+        assert not [ops for token, ops in bridges if token is body]
+
+    def test_virtual_body_with_bridges_not_abandoned(self):
+        # the same, but the virtual body has bridges already: keep it
+        def rleaves(code):
+            i = 0
+            r = 0
+            while i < 30:
+                r += rportal(code, Frame(1))
+                i += 1
+            return r
+        assert self.meta_interp(rleaves, [0], inline=True,
+                                callee_frame=2) == rleaves(0)
+        [vtoken] = [vtoken for vtoken in self.virtual_entries()
+                           if vtoken.virtual_body is not None]
+        body = vtoken.virtual_body
+        for i in range(20):
+            assert self.call_virtual_entry(vtoken, 10, 0) == 55
+        assert body.virtual_body_has_bridges
+        jd = get_stats().metainterp_sd.jitdrivers_sd[0]
+        jd.warmstate.disable_noninlinable_function(body.virtual_body_greenkey)
+        for i in range(20):
+            assert self.call_virtual_entry(vtoken, 12, 0) == 144
+        assert not body.virtual_body_abandoned
 
     def test_virtual_body_bridge_keeps_frame_virtual(self):
         bridges, undo = self.collect_bridges()

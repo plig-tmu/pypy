@@ -447,6 +447,11 @@ class JitCellToken(AbstractDescr):
     is_virtual_entry = False
     virtual_entry_label = None   # keeps alive the TargetToken it jumps to
     virtual_body = None          # the loop a virtual entry is redirected to
+    is_virtual_body = False
+    virtual_body_greenkey = None   # of the procedure of a virtual body
+    virtual_body_fallback = None   # see compile.abandon_virtual_body()
+    virtual_body_abandoned = False
+    virtual_body_has_bridges = False
     # and more data specified by the backend when the loop is compiled
     number = -1
     generation = r_int64(0)

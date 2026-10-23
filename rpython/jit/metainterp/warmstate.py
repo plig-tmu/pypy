@@ -133,6 +133,7 @@ JC_DONT_TRACE_HERE = 0x02
 JC_TEMPORARY       = 0x04
 JC_TRACING_OCCURRED= 0x08
 JC_FORCE_FINISH    = 0x10
+JC_RECURSION_LIMIT = 0x20
 
 class BaseJitCell(object):
     """Subclasses of BaseJitCell are used in tandem with the single
@@ -183,6 +184,10 @@ class BaseJitCell(object):
         JC_FORCE_FINISH: when from a cell with that flag set, if the trace
         becomes too long, "segment" it, ie finish it with a guard_always_fails.
         this prevents re-tracing and failing this again and again.
+
+        JC_RECURSION_LIMIT: JC_DONT_TRACE_HERE was set only because a
+        trace reached max_unroll_recursion, not because of a trace too
+        long (callee_frame: see can_inline_callable_in_virtual_body).
     """
     flags = 0     # JC_xxx flags
     wref_procedure_token = None
@@ -336,6 +341,7 @@ class WarmEnterState(object):
     def disable_noninlinable_function(self, greenkey):
         cell = self.JitCell.ensure_jit_cell_at_key(greenkey)
         cell.flags |= JC_DONT_TRACE_HERE
+        cell.flags &= ~JC_RECURSION_LIMIT
         debug_start("jit-disableinlining")
         loc = self.get_location_str(greenkey)
         debug_print("disabled inlining", loc)
@@ -657,6 +663,7 @@ class WarmEnterState(object):
             def dont_trace_here(*greenargs):
                 cell = JitCell._ensure_jit_cell_at_key(*greenargs)
                 cell.flags |= JC_DONT_TRACE_HERE
+                cell.flags &= ~JC_RECURSION_LIMIT
 
             @staticmethod
             def mark_as_being_traced(*greenargs):
@@ -689,6 +696,30 @@ class WarmEnterState(object):
             return True
         self.can_inline_callable = can_inline_callable
 
+        def can_inline_callable_in_virtual_body(greenkey):
+            # callee_frame: like can_inline_callable(), but ignoring a
+            # JC_DONT_TRACE_HERE set by max_unroll_recursion; see
+            # MetaInterp.tracing_from_virtual_body()
+            greenargs = unwrap_greenkey(greenkey)
+            if can_never_inline(*greenargs):
+                return False
+            cell = JitCell.get_jitcell(*greenargs)
+            if cell is not None and (cell.flags & JC_DONT_TRACE_HERE) != 0:
+                return (cell.flags & JC_RECURSION_LIMIT) != 0
+            return True
+        self.can_inline_callable_in_virtual_body = (
+            can_inline_callable_in_virtual_body)
+
+        def inlining_disabled_by_trace_too_long(greenkey):
+            # callee_frame: see compile.abandon_virtual_body()
+            greenargs = unwrap_greenkey(greenkey)
+            cell = JitCell.get_jitcell(*greenargs)
+            return (cell is not None and
+                    (cell.flags & JC_DONT_TRACE_HERE) != 0 and
+                    (cell.flags & JC_RECURSION_LIMIT) == 0)
+        self.inlining_disabled_by_trace_too_long = (
+            inlining_disabled_by_trace_too_long)
+
         def dont_trace_here(greenkey):
             # Set greenkey as somewhere that tracing should not occur into;
             # notice that, as per the description of JC_DONT_TRACE_HERE earlier,
@@ -697,7 +728,15 @@ class WarmEnterState(object):
             # is encountered.
             cell = JitCell.ensure_jit_cell_at_key(greenkey)
             cell.flags |= JC_DONT_TRACE_HERE
+            cell.flags &= ~JC_RECURSION_LIMIT
         self.dont_trace_here = dont_trace_here
+
+        def recursion_limit_reached(greenkey):
+            # like dont_trace_here(), when max_unroll_recursion is reached
+            cell = JitCell.ensure_jit_cell_at_key(greenkey)
+            if (cell.flags & JC_DONT_TRACE_HERE) == 0:
+                cell.flags |= JC_DONT_TRACE_HERE | JC_RECURSION_LIMIT
+        self.recursion_limit_reached = recursion_limit_reached
 
         def mark_as_being_traced(greenkey):
             cell = JitCell.ensure_jit_cell_at_key(greenkey)
